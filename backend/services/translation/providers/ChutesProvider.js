@@ -15,8 +15,8 @@ class ChutesProvider extends BaseProvider {
         const chunks = this.splitTextIntoChunks(text, 2500);
         console.log(`[Chutes] Traduciendo ${chunks.length} chunks con Gemma 3...`);
 
-        // Process in smaller batches to avoid rate limits/quota issues
-        const BATCH_SIZE = 2;
+        // Process in larger batches to improve speed
+        const BATCH_SIZE = 5;
         const translatedChunks = new Array(chunks.length);
 
         for (let i = 0; i < chunks.length; i += BATCH_SIZE) {

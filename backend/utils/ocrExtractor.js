@@ -5,53 +5,63 @@ const path = require('path');
 async function extractTextFromImage(imagePath) {
   try {
     const worker = await createWorker('eng+spa', 1, {
-      logger: m => console.log(m)
+      logger: m => {
+        if (m.status === 'recognizing text') {
+          console.log(`[IA Visión] ${Math.round(m.progress * 100)}% completado...`);
+        }
+      }
     });
 
-    const { data: { text } } = await worker.recognize(imagePath);
+    // Recognize and get full data structure
+    const { data } = await worker.recognize(imagePath);
     await worker.terminate();
 
-    if (!text || text.trim().length === 0) {
-      throw new Error('No se pudo extraer texto de la imagen. Asegúrate de que la imagen tenga texto legible.');
+    if (!data.text || data.text.trim().length === 0) {
+      throw new Error('No se pudo extraer texto de la imagen. Asegúrate de que la imagen sea clara.');
     }
 
+    // Map lines to items for better translation quality than words
+    // Smartcat translates whole blocks/lines for context
+    const items = data.lines.map(line => ({
+      text: line.text.trim(),
+      x: line.bbox.x0,
+      y: line.bbox.y0,
+      width: line.bbox.x1 - line.bbox.x0,
+      height: line.bbox.y1 - line.bbox.y0,
+      fontSize: (line.bbox.y1 - line.bbox.y0) * 0.75, // Adjusting for line height
+      pageIndex: 0,
+      color: [0, 0, 0] // Default black for OCR for now
+    })).filter(item => item.text.length > 0);
+
     return {
-      text: text.trim(),
+      text: data.text.trim(),
+      items: items,
       source: 'ocr'
     };
   } catch (error) {
-    console.error('Error extracting text from image with OCR:', error);
-    throw new Error('No se pudo extraer texto de la imagen. Asegúrate de que la imagen tenga texto legible.');
+    console.error('Error en IA de Visión (OCR):', error);
+    throw new Error('No se pudo procesar la imagen con la calidad Smartcat requerida.');
   }
 }
 
 async function extractTextFromScannedPDF(pdfPath) {
   try {
-    // For scanned PDFs, we need to convert pages to images first
-    // This is a simplified version - in production you'd use pdf2pic or similar
-    // For now, we'll try pdf-parse first, and if it fails with no text, suggest OCR
-
     const pdfParse = require('pdf-parse');
     const dataBuffer = fs.readFileSync(pdfPath);
     const data = await pdfParse(dataBuffer);
 
     if (data.text && data.text.trim().length > 10) {
-      // PDF has extractable text
       return {
         text: data.text,
         pages: data.numpages,
         source: 'pdf'
       };
     } else {
-      // PDF appears to be scanned, suggest OCR
-      throw new Error('El PDF parece ser escaneado. Para PDFs escaneados, sube las imágenes individuales (PNG/JPG) para usar OCR.');
+      throw new Error('El PDF parece ser escaneado. Súbelo como imagen (screenshot) para una traducción de alta fidelidad.');
     }
   } catch (error) {
-    if (error.message.includes('escaneado')) {
-      throw error;
-    }
-    console.error('Error extracting text from scanned PDF:', error);
-    throw new Error('Error al procesar el PDF escaneado.');
+    console.error('Error en extracción básica de PDF:', error);
+    throw error;
   }
 }
 

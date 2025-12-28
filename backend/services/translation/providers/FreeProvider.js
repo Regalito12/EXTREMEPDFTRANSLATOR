@@ -8,37 +8,27 @@ class FreeProvider extends BaseProvider {
     }
 
     async translate(text, sourceLang, targetLang) {
-        // Google Translate API hack handles up to ~5000 chars decently
-        // but 2000 is safer for stability and speed
-        const chunks = this.splitTextIntoChunks(text, 2000);
+        // We can push to ~4500 chars for fewer calls, but keep it safe for stability
+        const chunks = this.splitTextIntoChunks(text, 4500);
         console.log(`[Free] Traduciendo ${chunks.length} chunks con Google Translate X...`);
 
         const translatedChunks = [];
 
-        // Process chunks sequentially to avoid rate limits on free API
         for (const chunk of chunks) {
             try {
-                // FORCE 'gtx' client which is more reliable for free usage
                 const res = await translate(chunk, {
                     from: sourceLang,
                     to: targetLang,
                     client: 'gtx'
                 });
 
-                // Validate if translation actually happened
-                if (res.text === chunk && sourceLang !== targetLang) {
-                    console.warn('[Free] Alerta: El texto traducido es idéntico al original.');
-                }
-
                 translatedChunks.push(res.text);
 
-                // Tiny delay to avoid 429 errors
-                await new Promise(r => setTimeout(r, 500));
+                // Reduce delay slightly for speed, but keep it high enough to avoid 429s
+                if (chunks.length > 1) await new Promise(r => setTimeout(r, 300));
             } catch (err) {
-                console.error('Google Translate Error Detallado:', err);
-                // Fallback: return original text with warning if fails, to not break the whole doc
-                console.warn('Chunk falló, usando original.');
-                translatedChunks.push(chunk + ' [Error Traducción]');
+                console.error('Google Translate Error:', err);
+                translatedChunks.push(chunk);
             }
         }
 

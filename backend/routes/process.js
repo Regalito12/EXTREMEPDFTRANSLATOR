@@ -42,7 +42,6 @@ router.post('/process/:id', async (req, res) => {
   const { format = 'pdf', provider = 'free', apiKey = '', sourceLang = 'en', targetLang = 'es' } = req.body;
 
   try {
-    // Verify file exists first
     const uploadsDir = path.join(__dirname, '../uploads');
     const files = await fs.readdir(uploadsDir);
     const fileName = files.find(file => file.startsWith(`${id}-`));
@@ -53,7 +52,6 @@ router.post('/process/:id', async (req, res) => {
 
     const filePath = path.join(uploadsDir, fileName);
 
-    // Initialize processing status
     processingStatus.set(id, {
       status: 'processing',
       progress: 5,
@@ -61,64 +59,58 @@ router.post('/process/:id', async (req, res) => {
       step: 'extraction'
     });
 
-    // Respond immediately - process will run in background
     res.json({
       success: true,
       message: 'Procesamiento iniciado',
       processId: id
     });
 
-    // Run processing in background (non-blocking)
     setImmediate(async () => {
       console.log(`[DEBUG] Starting background processing for ${id}`);
       try {
-        let extractedContent;
+        let extractedData;
         let fileExt = path.extname(fileName).toLowerCase();
-        console.log(`[DEBUG] File extension: ${fileExt}, File: ${fileName}`);
 
         // Step 1: Extract text
         updateStatus(id, 15, 'Extrayendo texto del documento...', 'extraction');
-        console.log(`[DEBUG] Starting extraction...`);
 
         if (fileExt === '.pdf') {
           try {
-            const result = await extractTextFromPDF(filePath);
-            extractedContent = result.text;
+            extractedData = await extractTextFromPDF(filePath);
           } catch (error) {
             console.log('PDF text extraction failed, trying OCR...', error.message);
-            try {
-              updateStatus(id, 25, 'Usando OCR para PDF escaneado...', 'extraction');
-              const ocrResult = await extractTextFromScannedPDF(filePath);
-              extractedContent = ocrResult.text;
-            } catch (ocrError) {
-              throw new Error('No se pudo extraer texto del PDF.');
-            }
+            updateStatus(id, 25, 'Usando OCR para PDF escaneado...', 'extraction');
+            const ocrResult = await extractTextFromScannedPDF(filePath);
+            extractedData = {
+              text: ocrResult.text,
+              items: ocrResult.items || [], // Propagate coordinates if OCR can find them
+              source: 'ocr'
+            };
           }
         } else if (['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'].includes(fileExt)) {
-          updateStatus(id, 20, 'Procesando imagen con OCR...', 'extraction');
+          updateStatus(id, 20, 'Procesando imagen con IA de visión...', 'extraction');
           const ocrResult = await extractTextFromImage(filePath);
-          extractedContent = ocrResult.text;
+          extractedData = {
+            text: ocrResult.text,
+            items: ocrResult.items, // Now containing coordinates!
+            source: 'ocr'
+          };
         } else if (['.txt'].includes(fileExt)) {
-          // Support for plain text files
-          extractedContent = await fs.readFile(filePath, 'utf-8');
+          const text = await fs.readFile(filePath, 'utf-8');
+          extractedData = { text: text, source: 'text' };
         } else if (['.docx'].includes(fileExt)) {
-          // DOCX support using mammoth
-          try {
-            const mammoth = require('mammoth');
-            const result = await mammoth.extractRawText({ path: filePath });
-            extractedContent = result.value;
-          } catch (err) {
-            throw new Error('No se pudo leer el archivo DOCX. Asegúrate de que no esté corrupto.');
-          }
+          const mammoth = require('mammoth');
+          const result = await mammoth.extractRawText({ path: filePath });
+          extractedData = { text: result.value, source: 'docx' };
         } else {
           throw new Error(`Formato de archivo no soportado: ${fileExt}`);
         }
 
-        if (!extractedContent || extractedContent.trim().length === 0) {
+        if (!extractedData.text || extractedData.text.trim().length === 0) {
           throw new Error('El archivo no contiene texto extraíble.');
         }
 
-        updateStatus(id, 35, `Texto extraído (${extractedContent.length} caracteres)`, 'extraction');
+        updateStatus(id, 35, `Texto extraído (${extractedData.text.length} caracteres)`, 'extraction');
 
         // Step 2: Translate text
         const srcName = langNames[sourceLang] || sourceLang;
@@ -126,7 +118,46 @@ router.post('/process/:id', async (req, res) => {
         updateStatus(id, 50, `Traduciendo de ${srcName} a ${tgtName}...`, 'translation');
 
         const translateOptions = { provider, apiKey };
-        const translatedText = await TranslationService.translate(extractedContent, sourceLang, targetLang, translateOptions);
+        let translatedItems = [];
+        let translatedFullText = "";
+
+        if (extractedData.items && format === 'pdf') {
+          // Process individual items for layout preservation
+          // We'll translate groups of items to maintain context and speed
+          // Use a very unique separator that AI models are less likely to "fix" or translate
+          const SEPARATOR = `###_ITEM_SEP_${Math.floor(Math.random() * 100000)}_###`;
+          const CHUNK_SIZE = provider === 'free' ? 50 : 10;
+
+          for (let i = 0; i < extractedData.items.length; i += CHUNK_SIZE) {
+            const chunk = extractedData.items.slice(i, i + CHUNK_SIZE);
+            const combinedText = chunk.map(item => item.text).join(`\n${SEPARATOR}\n`);
+
+            console.log(`[DEBUG] Enviando chunk ${i} a traducción (${chunk.length} items)...`);
+            const translatedChunkText = await TranslationService.translate(combinedText, sourceLang, targetLang, translateOptions);
+
+            // Split carefully, handling potential whitespace issues from AI
+            const translatedParts = translatedChunkText.split(SEPARATOR).map(p => p.trim());
+
+            chunk.forEach((item, idx) => {
+              // Only replace if we got a valid part, otherwise keep original
+              let translated = translatedParts[idx];
+
+              // Smartcat Quality Clean
+              translated = cleanSpanishText(translated);
+
+              translatedItems.push({
+                ...item,
+                text: (translated && translated.length > 0) ? translated : item.text
+              });
+            });
+
+            const progress = 50 + Math.floor((i / extractedData.items.length) * 30);
+            updateStatus(id, progress, `Traduciendo... (${Math.floor((i / extractedData.items.length) * 100)}%)`, 'translation');
+          }
+        } else {
+          translatedFullText = await TranslationService.translate(extractedData.text, sourceLang, targetLang, translateOptions);
+          translatedFullText = cleanSpanishText(translatedFullText);
+        }
 
         updateStatus(id, 80, `¡Traducido a ${tgtName}!`, 'translation');
 
@@ -140,18 +171,31 @@ router.post('/process/:id', async (req, res) => {
 
         if (format === 'docx') {
           outputFilePath = path.join(outputDir, `traducido-${id}.docx`);
-          await generateTranslatedDOCX(translatedText, outputFilePath);
+          await generateTranslatedDOCX(translatedFullText || translatedItems.map(i => i.text).join(' '), outputFilePath);
         } else {
           outputFilePath = path.join(outputDir, `traducido-${id}.pdf`);
-          await generateTranslatedPDF(translatedText, outputFilePath);
+          if (translatedItems.length > 0) {
+            try {
+              await generateTranslatedPDF(translatedItems, filePath, outputFilePath);
+            } catch (genError) {
+              console.error('[CRITICAL] Smartcat Generation failed, using secure fallback...', genError.message);
+              const { generateTranslatedPDF: legacyGenerate } = require('../utils/pdfGenerator_v1');
+              const combinedText = translatedFullText || translatedItems.map(i => i.text).join('\n');
+              await legacyGenerate(combinedText, filePath, outputFilePath);
+              updateStatus(id, 100, '¡Traducción completada! (Modo Seguro Activo)', 'completed', outputFilePath);
+              return;
+            }
+          } else {
+            // Fallback for OCR or plain text conversion to PDF
+            const { generateTranslatedPDF: legacyGenerate } = require('../utils/pdfGenerator_v1');
+            await legacyGenerate(translatedFullText, filePath, outputFilePath);
+          }
         }
 
-        // Step 4: Complete
-        updateStatus(id, 100, '¡Traducción completada!', 'completed', outputFilePath, extractedContent, translatedText);
+        updateStatus(id, 100, '¡Traducción completada!', 'completed', outputFilePath, extractedData.text, translatedFullText || "Layout-preserved PDF");
 
-        // Clean up input file
         try {
-          await fs.unlink(filePath);
+          // await fs.unlink(filePath); // Keep for now to debug
         } catch (err) {
           console.error('Error deleting original file:', err);
         }
@@ -189,7 +233,6 @@ router.get('/download/:id', (req, res) => {
     });
   }
 
-  // Use correct extension based on actual file
   const ext = path.extname(filePath);
   const downloadName = `traducido-${id}${ext}`;
 
@@ -197,20 +240,14 @@ router.get('/download/:id', (req, res) => {
     if (err) {
       console.error('Error downloading file:', err);
     } else {
-      // Clean up files after download
-      setTimeout(() => {
-        cleanupFiles(id);
-      }, 5000);
+      // Aggressive cleanup disabled as per plan
+      // We will let the background cleanup handles it after 1 hour
     }
   });
 });
 
-// Remove the processPDF function since we've integrated its logic into the POST endpoint
-
 async function generateTranslatedDOCX(content, outputPath) {
   const doc = new Document();
-
-  // Split content into paragraphs and add to document
   const paragraphs = content.split('\n\n').filter(line => line.trim().length > 0);
   paragraphs.forEach(paragraphText => {
     doc.addSection({
@@ -219,8 +256,6 @@ async function generateTranslatedDOCX(content, outputPath) {
       ]
     });
   });
-
-  // Save document
   const buffer = await Packer.toBuffer(doc);
   await fs.writeFile(outputPath, buffer);
 }
@@ -234,38 +269,69 @@ function updateStatus(id, progress, message, step, outputPath = null, originalTe
     timestamp: new Date().toISOString()
   };
 
-  if (outputPath) {
-    status.outputPath = outputPath;
-  }
-
-  if (originalText) {
-    status.originalText = originalText.substring(0, 1000) + (originalText.length > 1000 ? '...' : '');
-  }
-
-  if (translatedText) {
-    status.translatedText = translatedText.substring(0, 1000) + (translatedText.length > 1000 ? '...' : '');
-  }
+  if (outputPath) status.outputPath = outputPath;
+  if (originalText) status.originalText = originalText.substring(0, 1000);
+  if (translatedText) status.translatedText = translatedText.substring(0, 1000);
 
   processingStatus.set(id, status);
+
+  // Set a cleanup timeout for finished/failed processes (1 hour)
+  if (status.status === 'completed' || status.status === 'error') {
+    setTimeout(() => {
+      cleanupFiles(id);
+    }, 60 * 60 * 1000);
+  }
 }
 
 function cleanupFiles(id) {
   const uploadsDir = path.join(__dirname, '../uploads');
-
-  // Remove all files related to this process
-  const files = fs.readdirSync(uploadsDir);
-  files.forEach(file => {
-    if (file.includes(id)) {
-      try {
-        fs.unlinkSync(path.join(uploadsDir, file));
-      } catch (err) {
-        console.error('Error cleaning up file:', err);
+  try {
+    const files = fs.readdirSync(uploadsDir);
+    files.forEach(file => {
+      if (file.includes(id)) {
+        try {
+          fs.unlinkSync(path.join(uploadsDir, file));
+        } catch (err) { }
       }
-    }
-  });
+    });
+    processingStatus.delete(id);
+  } catch (err) {
+    console.error('Error in cleanup:', err);
+  }
+}
 
-  // Remove from memory
-  processingStatus.delete(id);
+// Final check and cleaning of translated text to ensure "Smartcat" elegance
+// This aggressively removes non-standard diacritics (dots below, etc) 
+// while preserving legitimate Spanish characters.
+function cleanSpanishText(text) {
+  if (!text) return text;
+
+  // 1. Normalize to NFD to separate diacritics
+  let normalized = text.normalize('NFD');
+
+  // 2. Strict Whitelist: Only allow base characters + Spanish-approved diacritics
+  // Standard Spanish: á, é, í, ó, ú, ü (diaeresis), ñ (tilde)
+  const allowedMarks = ['\u0301', '\u0308', '\u0303']; // acute, diaeresis, tilde
+
+  let cleaned = "";
+  for (let i = 0; i < normalized.length; i++) {
+    const charCode = normalized.charCodeAt(i);
+    // If it's a combining mark
+    if (charCode >= 0x0300 && charCode <= 0x036F) {
+      if (allowedMarks.includes(normalized[i])) {
+        cleaned += normalized[i];
+      }
+      // Else skip it (the weird dot under/over)
+    } else {
+      cleaned += normalized[i];
+    }
+  }
+
+  return cleaned.normalize('NFC')
+    // 3. Final safety: remove anything that isn't a standard character for Spanish/English
+    .replace(/[^\x20-\x7E\xA0-\xFF\u2010-\u201D\u00BF\u00A1]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 module.exports = router;
